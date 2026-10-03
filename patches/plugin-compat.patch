@@ -1,0 +1,12 @@
+diff --git a/android/plugin.go b/android/plugin.go
+index 5586a84..8725142 100644
+--- a/android/plugin.go
++++ b/android/plugin.go
+@@ -70,6 +70,7 @@ var allowedPluginsByName = map[string]bool{
+ 	"xsdc-soong-rules":                       true,
+ 	"soong-libaosprecovery_defaults":	  true,
+ 	"soong-libguitwrp_defaults":		  true,
++	"soong-libfoxui_defaults":		  true,
+ 	"soong-libminuitwrp_defaults":		  true,
+ 	"soong-vold_defaults":			  true,
+ }
