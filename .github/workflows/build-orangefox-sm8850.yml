@@ -110,7 +110,7 @@ jobs:
 
       - name: Combine hosted runner build disks and create swap
         if: inputs.runner != 'self-hosted' && steps.disks.outputs.combine == 'true'
-        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6ad5794
+        uses: easimon/maximize-build-space@v10
         with:
           build-mount-path: ${{ env.BUILD_ROOT }}
           root-reserve-mb: 8192
