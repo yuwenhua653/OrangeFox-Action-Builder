@@ -119,6 +119,37 @@ jobs:
           overprovision-lvm: 'false'
           remove-docker-images: 'true'
 
+      - name: Ensure hosted runner has at least 8 GiB swap
+        if: inputs.runner != 'self-hosted'
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_ROOT"
+          # Disk combining may be skipped when /mnt shares the root filesystem.
+          # Keep existing swap and add only the missing capacity.
+          target_kib=$(( 8 * 1024 * 1024 ))
+          current_kib=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+          if (( current_kib < target_kib )); then
+            # Reserve one extra MiB for the swap header.
+            extra_mib=$(( (target_kib - current_kib + 1023) / 1024 + 1 ))
+            available_bytes=$(df --output=avail -B1 "$BUILD_ROOT" | tail -1)
+            required_bytes=$(( extra_mib * 1048576 + 55 * 1073741824 ))
+            if (( available_bytes < required_bytes )); then
+              echo '::error::Not enough storage for extra swap and the minimum build space.'
+              df -h "$BUILD_ROOT"
+              exit 1
+            fi
+            swap_file="$BUILD_ROOT/runner-extra.swap"
+            [[ ! -e "$swap_file" ]] || { echo '::error::Extra swap file already exists.'; exit 1; }
+            sudo install -m 600 /dev/null "$swap_file"
+            sudo dd if=/dev/zero of="$swap_file" bs=1M count="$extra_mib" status=progress conv=fsync
+            sudo mkswap "$swap_file"
+            sudo swapon "$swap_file"
+          fi
+          current_kib=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+          (( current_kib >= target_kib )) || { echo '::error::Swap capacity is below 8 GiB.'; exit 1; }
+          free -h
+          swapon --show
+
       - name: Prepare build directories
         run: |
           set -euo pipefail
@@ -322,6 +353,65 @@ jobs:
         run: |
           set -eo pipefail
           cd "$FOX_SOURCE"
+          # Emit resource snapshots to Actions console even if artifact upload is interrupted.
+          # Python sleeps in its own process, so cleanup has no sleeping shell child to leave behind.
+          python3 -u - "$BUILD_ROOT" "$LOG_DIR/resources.log" <<'PY' &
+          import datetime
+          import pathlib
+          import subprocess
+          import sys
+          import time
+
+          build_root, log_path = sys.argv[1:]
+          cgroup = pathlib.Path('/sys/fs/cgroup')
+          try:
+              for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines():
+                  _, controllers, relative = line.split(':', 2)
+                  candidate = cgroup / relative.lstrip('/')
+                  if not controllers and (candidate / 'memory.events').is_file():
+                      cgroup = candidate
+                      break
+          except (OSError, ValueError):
+              pass
+          while True:
+              stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              parts = [f'Resource snapshot {stamp}\n']
+              commands = [
+                  ['free', '-h'],
+                  ['swapon', '--show'],
+                  ['df', '-h', build_root],
+                  ['ps', '-eo', 'pid,comm,rss', '--sort=-rss'],
+              ]
+              for command in commands:
+                  try:
+                      result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, timeout=5, check=False)
+                      output = result.stdout
+                      if command[0] == 'ps':
+                          output = '\n'.join(output.splitlines()[:9]) + '\n'
+                      parts.append(output)
+                  except (OSError, subprocess.TimeoutExpired) as error:
+                      parts.append(f'{command[0]} unavailable: {error}\n')
+              paths = [pathlib.Path('/proc/pressure/memory')]
+              paths += [cgroup / name for name in (
+                  'memory.current', 'memory.max', 'memory.events',
+                  'memory.swap.current', 'memory.swap.max')]
+              for path in paths:
+                  try:
+                      parts.append(f'{path}:\n{path.read_text()}\n')
+                  except OSError:
+                      pass
+              snapshot = ''.join(parts)
+              print(snapshot, end='', flush=True)
+              try:
+                  with open(log_path, 'a', encoding='utf-8') as log:
+                      log.write(snapshot)
+              except OSError as error:
+                  print(f'Resource log unavailable: {error}', flush=True)
+              time.sleep(30)
+          PY
+          resource_monitor_pid=$!
+          trap 'kill "$resource_monitor_pid" 2>/dev/null || true; wait "$resource_monitor_pid" 2>/dev/null || true' EXIT
           git -C bootable/recovery diff > "$OUTPUT_DIR/recovery-integration.patch"
           git -C vendor/recovery diff > "$OUTPUT_DIR/installer-integration.patch"
           git -C build/soong diff > "$OUTPUT_DIR/soong-integration.patch"
