@@ -146,6 +146,9 @@ jobs:
           cat > .repo/local_manifests/sm8850.xml <<XML
           <?xml version="1.0" encoding="UTF-8"?>
           <manifest>
+            <!-- Reference devices are not dependencies of the supplied SM8850 tree. -->
+            <remove-project name="device/mondrian" />
+            <remove-project name="device/sm84xx-common" />
             <extend-project name="bootable/Recovery" path="bootable/recovery" revision="$FOX_RECOVERY_REVISION" />
             <extend-project name="vendor/recovery" path="vendor/recovery" revision="$FOX_VENDOR_REVISION" />
             <extend-project name="build/soong" path="build/soong" revision="$FOX_SOONG_REVISION" />
@@ -324,9 +327,22 @@ jobs:
           git -C build/soong diff > "$OUTPUT_DIR/soong-integration.patch"
           git -C device/xiaomi/sm8850 diff > "$OUTPUT_DIR/device-integration.patch"
           cp device/xiaomi/sm8850/vendorsetup.sh "$OUTPUT_DIR/vendorsetup.sh"
-          source build/envsetup.sh
-          # envsetup loads other reference trees; select our exports explicitly afterwards.
+          # Select the device before envsetup scans any vendorsetup scripts.
           source device/xiaomi/sm8850/vendorsetup.sh
+          # Android's interactive initialization contains expected nonzero probes.
+          # Keep those probes from triggering Bash's errexit/pop_var_context failure.
+          set +e
+          source build/envsetup.sh > >(tee "$LOG_DIR/envsetup.log") 2>&1
+          envsetup_status=$?
+          set -e
+          if (( envsetup_status != 0 )); then
+            echo "::error::Android environment initialization failed ($envsetup_status)."
+            exit "$envsetup_status"
+          fi
+          # Preserve our exports after any common vendor initialization.
+          source device/xiaomi/sm8850/vendorsetup.sh
+          declare -F lunch >/dev/null || { echo '::error::lunch was not initialized.'; exit 1; }
+          command -v m >/dev/null || { echo '::error::Android build command m is missing.'; exit 1; }
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
