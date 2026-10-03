@@ -1,0 +1,418 @@
+# Unofficial OrangeFox Android 16 build for the supplied unified SM8850 tree.
+# Put this file in .github/workflows/ on your repository's default branch.
+# This workflow has been statically checked; it has not been built or tested on a phone.
+name: Build OrangeFox SM8850 (Android 16)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_tree_ref:
+        description: 'Device tree ref (default pins the checked twrp-16.0 commit)'
+        type: string
+        required: true
+        default: '907b78a804f5a47c4ccd66da0e5dd776cefc077d'
+      build_jobs:
+        description: 'Build jobs (2 is suitable for the first build)'
+        type: string
+        required: true
+        default: '2'
+      runner:
+        description: 'Runner (self-hosted needs Linux x64 and passwordless sudo)'
+        type: choice
+        required: true
+        default: ubuntu-24.04
+        options:
+          - ubuntu-24.04
+          - self-hosted
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orangefox-sm8850-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEVICE_TREE_URL: https://github.com/lingqiqi5211/twrp_device_xiaomi_sm8850.git
+  FOX_MANIFEST_URL: https://gitlab.com/OrangeFox/Manifest.git
+  # Checked official fox_16.0 manifest and recovery; vendor is from official main.
+  FOX_MANIFEST_REVISION: 4c65ca28fa67580172ee6bf99892a054c19dcebe
+  FOX_RECOVERY_REVISION: 0f7831d3240f4c3925a0b5fd7d2c907ddf8704c2
+  FOX_VENDOR_REVISION: cea00cabf2e8ce50fc9f0b5cda99b5801855847a
+  FOX_SOONG_REVISION: 6dc77879464584ef3f178cae622134ed0bf19e1e
+  BUILD_ROOT: ${{ github.workspace }}/orangefox-work
+  FOX_SOURCE: ${{ github.workspace }}/orangefox-work/source
+  LOG_DIR: ${{ github.workspace }}/orangefox-work/logs
+  OUTPUT_DIR: ${{ github.workspace }}/deliverables
+  DEVICE_TREE_REF: ${{ inputs.device_tree_ref }}
+  BUILD_JOBS: ${{ inputs.build_jobs }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted","linux","x64"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] && (( BUILD_JOBS <= 32 )) || {
+            echo '::error::build_jobs must be an integer from 1 to 32.'
+            exit 1
+          }
+          [[ "$DEVICE_TREE_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || {
+            echo '::error::Invalid device_tree_ref.'
+            exit 1
+          }
+          [[ "$(uname -m)" == x86_64 ]] || {
+            echo '::error::Use a Linux x86_64 runner.'
+            exit 1
+          }
+          # Do not delete existing source trees or results on self-hosted machines.
+          for path in "$BUILD_ROOT" "$OUTPUT_DIR"; do
+            if [[ -d "$path" && -n "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+              echo "::error::Directory is not empty: $path. Move it before starting another build."
+              exit 1
+            fi
+          done
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick \
+            lib32z1-dev libelf-dev libncurses-dev libssl-dev libxml2-utils \
+            lz4 lzop python3 repo rsync schedtool squashfs-tools \
+            unzip uuid-runtime xsltproc xz-utils zip zlib1g-dev lvm2
+          git config --global user.name 'OrangeFox Builder'
+          git config --global user.email 'orangefox-builder@users.noreply.github.com'
+
+      - name: Inspect hosted runner disks
+        if: inputs.runner != 'self-hosted'
+        id: disks
+        run: |
+          set -euo pipefail
+          # Cleanup is restricted to disposable GitHub-hosted runners.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/share/swift /usr/local/swift /usr/local/share/powershell
+          if [[ "$(findmnt -n -o SOURCE -T /)" != "$(findmnt -n -o SOURCE -T /mnt)" ]]; then
+            echo 'combine=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'combine=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Combine hosted runner build disks and create swap
+        if: inputs.runner != 'self-hosted' && steps.disks.outputs.combine == 'true'
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6ad5794
+        with:
+          build-mount-path: ${{ env.BUILD_ROOT }}
+          root-reserve-mb: 8192
+          temp-reserve-mb: 1024
+          swap-size-mb: 8192
+          overprovision-lvm: 'false'
+          remove-docker-images: 'true'
+
+      - name: Prepare build directories
+        run: |
+          set -euo pipefail
+          mkdir -p "$FOX_SOURCE" "$LOG_DIR" "$OUTPUT_DIR"
+          available_gib=$(( $(df --output=avail -B1 "$BUILD_ROOT" | tail -1) / 1073741824 ))
+          if (( available_gib < 55 )); then
+            echo "::error::Only ${available_gib} GiB is free. Use a runner with more build storage."
+            df -h
+            exit 1
+          fi
+          if (( available_gib < 85 )); then
+            echo "::warning::${available_gib} GiB is free; Android 16 may exhaust a standard hosted runner. For a reliable build, use a self-hosted runner with at least 100 GiB free."
+          fi
+          df -h "$BUILD_ROOT" | tee "$LOG_DIR/disk-before.txt"
+          free -h | tee "$LOG_DIR/memory-before.txt"
+
+      - name: Initialize official OrangeFox Android 16 sources
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE"
+          repo init --depth=1 -u "$FOX_MANIFEST_URL" -b "$FOX_MANIFEST_REVISION" \
+            --no-clone-bundle 2>&1 | tee "$LOG_DIR/repo-init.log"
+          mkdir -p .repo/local_manifests
+          # Pin the projects to which the device integration is applied.
+          cat > .repo/local_manifests/sm8850.xml <<XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <extend-project name="bootable/Recovery" path="bootable/recovery" revision="$FOX_RECOVERY_REVISION" />
+            <extend-project name="vendor/recovery" path="vendor/recovery" revision="$FOX_VENDOR_REVISION" />
+            <extend-project name="build/soong" path="build/soong" revision="$FOX_SOONG_REVISION" />
+          </manifest>
+          XML
+
+      - name: Sync source with bounded retries
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE"
+          synced=0
+          for attempt in 1 2 3; do
+            if repo sync -c -j4 --no-clone-bundle --no-tags --retry-fetches=3 \
+                2>&1 | tee "$LOG_DIR/repo-sync-${attempt}.log"; then
+              synced=1
+              break
+            fi
+            echo "Source sync attempt $attempt failed."
+            if (( attempt < 3 )); then sleep 10; fi
+          done
+          (( synced == 1 )) || exit 1
+          repo manifest -r -o "$OUTPUT_DIR/source-manifest.xml"
+          test -f bootable/recovery/orangefox.mk
+          test -f vendor/recovery/OrangeFox_A16.sh
+          test -f external/se_omapi/Android.bp
+
+      - name: Fetch the supplied SM8850 tree
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE"
+          mkdir -p device/xiaomi/sm8850
+          git -C device/xiaomi/sm8850 init
+          git -C device/xiaomi/sm8850 remote add origin "$DEVICE_TREE_URL"
+          git -C device/xiaomi/sm8850 fetch --depth=1 origin "$DEVICE_TREE_REF"
+          git -C device/xiaomi/sm8850 checkout --detach FETCH_HEAD
+          # Refuse empty blobs or an unexpected product/layout.
+          python3 - <<'PY'
+          import os, pathlib, re
+          tree = pathlib.Path(os.environ['FOX_SOURCE']) / 'device/xiaomi/sm8850'
+          board = (tree / 'BoardConfig.mk').read_text()
+          product = (tree / 'twrp_sm8850.mk').read_text()
+          assert re.search(r'^PRODUCT_DEVICE\s*:=\s*sm8850\s*$', product, re.M), 'Unexpected product'
+          assert re.search(r'^BOARD_RECOVERYIMAGE_PARTITION_SIZE\s*:=\s*104857600\s*$', board, re.M), 'Unexpected partition size'
+          assert re.search(r'^BOARD_EXCLUDE_KERNEL_FROM_RECOVERY_IMAGE\s*:=\s*true\s*$', board, re.M), 'Unexpected kernel layout'
+          assert (tree / 'prebuilt/kernel').stat().st_size > 1024 * 1024, 'Missing prebuilt kernel / LFS pointer'
+          PY
+          git -C device/xiaomi/sm8850 rev-parse HEAD > "$OUTPUT_DIR/device-tree-commit.txt"
+
+      - name: Integrate OrangeFox device and installer configuration
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE"
+          cat > device/xiaomi/sm8850/vendorsetup.sh <<'SH'
+          # Unified SM8850: keep PRODUCT_DEVICE and the SKU selection unchanged.
+          export FOX_BUILD_DEVICE=sm8850
+          export FOX_BUILD_TYPE=Unofficial
+          export FOX_AB_DEVICE=1
+          export FOX_VIRTUAL_AB_DEVICE=1
+          export FOX_VANILLA_BUILD=1
+          export OF_AB_DEVICE_WITH_RECOVERY_PARTITION=1
+          export FOX_INSTALLER_DISABLE_AUTOREBOOT=1
+          # Installer-only aliases. FOX_TARGET_DEVICES would also change ROM assert handling.
+          export TARGET_DEVICE_ALT='pudding,pandora,popsicle,nezha,byron,myron,athens,songyuan'
+          SH
+          # Also expose the recovery-partition selection to the Make/Soong configuration.
+          printf '\n# OrangeFox: virtual A/B with a dedicated recovery partition\nOF_AB_DEVICE_WITH_RECOVERY_PARTITION := 1\n' \
+            >> device/xiaomi/sm8850/BoardConfig.mk
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('vendor/recovery/installer/META-INF/com/google/android/update-binary')
+          text = p.read_text()
+          marker = '\tCheckRequirements\n'
+          assert text.count(marker) == 1, 'Installer changed; review integration before proceeding'
+          guard = '''
+          # SM8850 uses a kernel-less image in dedicated A/B recovery partitions.
+          # Do not allow the generic installer to fall back to boot-image repacking.
+          for slot in _a _b; do
+              [ -b "${RECOVERY_PARTITION}${slot}" ] || abort "- Dedicated recovery${slot} partition is missing."
+              part_size=$(blockdev --getsize64 "${RECOVERY_PARTITION}${slot}" 2>/dev/null) || abort "- Cannot read recovery${slot} size."
+              case "$part_size" in
+                  ''|*[!0-9]*) abort "- Invalid recovery${slot} size." ;;
+              esac
+              [ "$part_size" -gt 0 ] || abort "- Empty recovery${slot} partition."
+          done
+          '''
+          p.write_text(text.replace(marker, marker + guard))
+          PY
+          bash -n device/xiaomi/sm8850/vendorsetup.sh
+          bash -n vendor/recovery/installer/META-INF/com/google/android/update-binary
+
+      - name: Restore upstream per-SKU GUI offsets
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE/bootable/recovery"
+          # Backport from TWRP-Test/android_bootable_recovery twrp-16.0,
+          # commit 58e4cff2c5a21f4b01b5795a16bea59b2eb8dad2 (GPL upstream).
+          cat > "$LOG_DIR/runtime-offset.patch" <<'PATCH'
+          --- a/gui/pages.cpp
+          +++ b/gui/pages.cpp
+          @@ -48,6 +48,7 @@
+           #include <functional>
+           
+           
+          +#include <android-base/properties.h>
+           #include <ziparchive/zip_archive.h>
+           #include "ZipUtil.h"
+           
+          @@ -82,6 +83,19 @@
+           int tw_y_offset = 0;
+           int tw_w_offset = 0;
+           int tw_h_offset = 0;
+          +static void apply_offset_properties()
+          +{
+          +    std::string s;
+          +    s = android::base::GetProperty("ro.twrp.x_offset", "");
+          +    if (!s.empty()) tw_x_offset = atoi(s.c_str());
+          +    s = android::base::GetProperty("ro.twrp.y_offset", "");
+          +    if (!s.empty()) tw_y_offset = atoi(s.c_str());
+          +    s = android::base::GetProperty("ro.twrp.w_offset", "");
+          +    if (!s.empty()) tw_w_offset = atoi(s.c_str());
+          +    s = android::base::GetProperty("ro.twrp.h_offset", "");
+          +    if (!s.empty()) tw_h_offset = atoi(s.c_str());
+          +}
+          +
+           
+           // Helper routine to convert a string to a color declaration
+           int ConvertStrToColor(std::string str, COLOR* color)
+          @@ -1888,6 +1902,7 @@
+           		tw_y_offset = TW_Y_OFFSET;
+           		tw_w_offset = TW_W_OFFSET;
+           		tw_h_offset = TW_H_OFFSET;
+          +		apply_offset_properties();
+           		if (name != "splash") {
+           			LoadLanguageList(NULL);
+           			languageFile = LoadFileToBuffer(TWRES "languages/en.xml", NULL);
+          @@ -1901,6 +1916,7 @@
+           		tw_y_offset = 0;
+           		tw_w_offset = 0;
+           		tw_h_offset = 0;
+          +		apply_offset_properties();
+           		if (!TWFunc::Path_Exists(package)) {
+           			return -1;
+           		}
+          PATCH
+          git apply --check "$LOG_DIR/runtime-offset.patch"
+          git apply "$LOG_DIR/runtime-offset.patch"
+
+      - name: Permit the renamed OrangeFox GUI Soong plugin
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE/build/soong"
+          # Narrow allowlist correction for the UI plugin renamed by OrangeFox.
+          cat > "$LOG_DIR/plugin-compat.patch" <<'PATCH'
+          diff --git a/android/plugin.go b/android/plugin.go
+          index 5586a84..8725142 100644
+          --- a/android/plugin.go
+          +++ b/android/plugin.go
+          @@ -70,6 +70,7 @@ var allowedPluginsByName = map[string]bool{
+           	"xsdc-soong-rules":                       true,
+           	"soong-libaosprecovery_defaults":	  true,
+           	"soong-libguitwrp_defaults":		  true,
+          +	"soong-libfoxui_defaults":		  true,
+           	"soong-libminuitwrp_defaults":		  true,
+           	"soong-vold_defaults":			  true,
+           }
+          PATCH
+          git apply --check "$LOG_DIR/plugin-compat.patch"
+          git apply "$LOG_DIR/plugin-compat.patch"
+
+      - name: Record the integration and build
+        run: |
+          set -eo pipefail
+          cd "$FOX_SOURCE"
+          git -C bootable/recovery diff > "$OUTPUT_DIR/recovery-integration.patch"
+          git -C vendor/recovery diff > "$OUTPUT_DIR/installer-integration.patch"
+          git -C build/soong diff > "$OUTPUT_DIR/soong-integration.patch"
+          git -C device/xiaomi/sm8850 diff > "$OUTPUT_DIR/device-integration.patch"
+          cp device/xiaomi/sm8850/vendorsetup.sh "$OUTPUT_DIR/vendorsetup.sh"
+          source build/envsetup.sh
+          # envsetup loads other reference trees; select our exports explicitly afterwards.
+          source device/xiaomi/sm8850/vendorsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          export CCACHE_DIR="$BUILD_ROOT/ccache"
+          ccache -M 3G
+          # lunch must run in this shell so its product exports survive.
+          lunch twrp_sm8850-bp2a-eng > >(tee "$LOG_DIR/lunch.log") 2>&1
+          # Use the selected product, not a guessed model-specific product name.
+          m -j"$BUILD_JOBS" recoveryimage 2>&1 | tee "$LOG_DIR/build.log"
+
+      - name: Validate and collect image and official installer ZIP
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re, shutil, struct, zipfile
+          product = pathlib.Path(os.environ['FOX_SOURCE']) / 'out/target/product/sm8850'
+          output = pathlib.Path(os.environ['OUTPUT_DIR'])
+          image = product / 'recovery.img'
+          data = image.read_bytes()
+          assert 0 < len(data) <= 104857600, f'Invalid recovery size: {len(data)}'
+          assert data[:8] == b'ANDROID!', 'Expected Android boot-format recovery image'
+          kernel_size, ramdisk_size = struct.unpack_from('<II', data, 8)
+          header_version = struct.unpack_from('<I', data, 40)[0]
+          assert header_version == 4, f'Unexpected header: {header_version}'
+          assert kernel_size == 0 and ramdisk_size > 0, 'Expected kernel-less dedicated recovery'
+          shutil.copy2(image, output / 'recovery.img')
+          installers = sorted(p for p in product.glob('OrangeFox-*.zip') if not p.name.endswith('_lite.zip'))
+          assert installers, 'OrangeFox installer ZIP missing; do not package a raw image as a fake installer'
+          aliases = 'pudding,pandora,popsicle,nezha,byron,myron,athens,songyuan'
+          for package in installers:
+              with zipfile.ZipFile(package) as archive:
+                  assert archive.testzip() is None, 'ZIP CRC check failed'
+                  assert archive.read('recovery.img') == data, 'ZIP contains a different recovery image'
+                  script = archive.read('META-INF/com/google/android/update-binary').decode()
+                  for key in ('FOX_AB_DEVICE', 'FOX_VIRTUAL_AB_DEVICE', 'FOX_VANILLA_BUILD', 'FOX_INSTALLER_DISABLE_AUTOREBOOT'):
+                      assert re.search(r'^' + key + r'="?1"?\s*$', script, re.M), f'Missing installer flag: {key}'
+                  assert f'TARGET_DEVICE_ALT="{aliases}"' in script, 'Installer device aliases missing'
+                  assert 'Dedicated recovery${slot} partition is missing.' in script, 'Dedicated recovery guard missing'
+              shutil.copy2(package, output / package.name)
+          for image_file in product.glob('OrangeFox-*.img'):
+              assert image_file.read_bytes() == data, 'OrangeFox image differs from recovery.img'
+              shutil.copy2(image_file, output / image_file.name)
+          files = sorted(p for p in output.iterdir() if p.is_file() and p.suffix in ('.img', '.zip'))
+          (output / 'SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files))
+          report = f'Header v{header_version}; kernel={kernel_size}; ramdisk={ramdisk_size}; image={len(data)} bytes\n'
+          (output / 'image-check.txt').write_text(report)
+          print(report)
+          PY
+          df -h "$BUILD_ROOT" | tee "$LOG_DIR/disk-after.txt"
+          {
+            echo '### OrangeFox SM8850 build completed'
+            echo 'Download the OrangeFox-SM8850 artifact below.'
+            echo 'Unofficial build. Boot, screen, touch, decryption and flashing still need device testing.'
+            echo 'The installer ZIP writes both dedicated recovery slots and does not auto-reboot.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect failure diagnostics
+        if: failure()
+        run: |
+          set +e
+          mkdir -p "$LOG_DIR"
+          for file in soong.log verbose.log.gz error.log.gz error.log; do
+            if [[ -f "$FOX_SOURCE/out/$file" ]]; then
+              cp "$FOX_SOURCE/out/$file" "$LOG_DIR/"
+            fi
+          done
+          df -h > "$LOG_DIR/disk-failure.txt"
+          free -h > "$LOG_DIR/memory-failure.txt"
+
+      - name: Upload validated recovery artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-SM8850-${{ github.run_number }}
+          path: ${{ env.OUTPUT_DIR }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build and sync logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-SM8850-logs-${{ github.run_number }}
+          path: ${{ env.LOG_DIR }}/
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 14
