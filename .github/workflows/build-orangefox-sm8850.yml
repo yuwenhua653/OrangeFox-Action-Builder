@@ -349,6 +349,37 @@ jobs:
           git apply --check "$LOG_DIR/plugin-compat.patch"
           git apply "$LOG_DIR/plugin-compat.patch"
 
+      - name: Reduce hosted runner Soong memory usage
+        if: inputs.runner != 'self-hosted'
+        run: |
+          set -euo pipefail
+          cd "$FOX_SOURCE/build/soong"
+          # Blueprint launches soong_build with env -i, so shell exports alone do not reach it.
+          # Forward only the two Go runtime memory controls through its invocation environment.
+          cat > "$LOG_DIR/soong-memory.patch" <<'PATCH'
+          diff --git a/ui/build/soong.go b/ui/build/soong.go
+          --- a/ui/build/soong.go
+          +++ b/ui/build/soong.go
+          @@ -212,6 +212,12 @@ func (pb primaryBuilderFactory) primaryBuilderInvocation() bootstrap.PrimaryBuilderInvocation {
+          
+           	commonArgs = append(commonArgs, "-l", filepath.Join(pb.config.FileListDir(), "Android.bp.list"))
+           	invocationEnv := make(map[string]string)
+          +	// Preserve explicit Go memory tuning in the hermetic builder environment.
+          +	for _, key := range []string{"GOGC", "GOMEMLIMIT"} {
+          +		if value, ok := pb.config.Environment().Get(key); ok && value != "" {
+          +			invocationEnv[key] = value
+          +		}
+          +	}
+           	if pb.debugPort != "" {
+           		//debug mode
+           		commonArgs = append(commonArgs, "--delve_listen", pb.debugPort,
+          PATCH
+          git apply --check "$LOG_DIR/soong-memory.patch"
+          git apply "$LOG_DIR/soong-memory.patch"
+          printf '%s\n' 'GOGC=30' 'GOMEMLIMIT=10GiB' >> "$GITHUB_ENV"
+          echo 'Hosted Soong tuning: GOGC=30; GOMEMLIMIT=10GiB (soft Go runtime limit).'
+          "$FOX_SOURCE/prebuilts/go/linux-x86/bin/go" version
+
       - name: Record the integration and build
         run: |
           set -eo pipefail
@@ -389,6 +420,19 @@ jobs:
                       output = result.stdout
                       if command[0] == 'ps':
                           output = '\n'.join(output.splitlines()[:9]) + '\n'
+                          for row in output.splitlines()[1:]:
+                              fields = row.split()
+                              if len(fields) >= 2 and fields[1] == 'soong_build':
+                                  try:
+                                      raw_env = pathlib.Path(f'/proc/{fields[0]}/environ').read_bytes()
+                                      controls = {}
+                                      for entry in raw_env.split(b'\0'):
+                                          key, separator, value = entry.partition(b'=')
+                                          if separator and key in (b'GOGC', b'GOMEMLIMIT'):
+                                              controls[key.decode()] = value.decode(errors='replace')
+                                      parts.append(f'soong_build PID {fields[0]} memory controls: {controls}\n')
+                                  except OSError:
+                                      pass
                       parts.append(output)
                   except (OSError, subprocess.TimeoutExpired) as error:
                       parts.append(f'{command[0]} unavailable: {error}\n')
